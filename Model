@@ -1,0 +1,145 @@
+import pandas as pd
+import numpy as np
+from hmmlearn.hmm import GaussianHMM
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+warnings.filterwarnings("ignore")
+
+# ==========================================
+# 1. GET DATA
+# ==========================================
+ticker = "SPY"
+# We fetch 20 years of data to capture the 2008 crash, 2020 Covid crash, etc.
+# data = yf.download(ticker, start="2005-01-01", end="2025-01-01")
+# data = yf.download("SPY", period="max")["Close"]
+
+# File paths (will be set in main)
+SPY_filepath = "10 year rate, HY OAS and S&P500 combined.xlsx"
+
+df = pd.read_excel(SPY_filepath)
+# ==========================================
+# 2. FEATURE ENGINEERING
+# ==========================================
+# Step 1: Replace 0 with NaN
+df = df.replace(0, np.nan)
+
+# Step 2: Forward fill the NaNs
+df = df.ffill()
+df.dropna(inplace=True)
+df["Returns"] = df["S&P Close"].pct_change()
+# Using 21-day (approx 1 trading month) rolling volatility
+df["Volatility"] = df["Returns"].rolling(window=21).std()
+
+# Credit: Absolute change (Difference in Basis Points)
+# If OAS goes from 4.00 to 4.20, this gives 0.20
+df["OAS_Diff"] = df["BAMLH0A0HYM2"].diff()
+
+# Rates: Absolute change
+df["Rate_Diff"] = df["DGS10"].diff()
+
+df.dropna(inplace=True)
+
+
+feature_cols = ["Returns", "Volatility", "OAS_Diff", "Rate_Diff"]
+
+
+# Instead of using StandardScaler (Global Scaling)
+# We use expanding window scaling (Local Scaling)
+
+def expanding_z_score(df_column):
+    # This calculates the mean/std for all data up to the current row
+    # min_periods=30 ensures we have at least 30 days of data before we start scaling
+    mean = df_column.expanding(min_periods=30).mean()
+    std = df_column.expanding(min_periods=30).std()
+    return (df_column - mean) / std
+
+
+for col in feature_cols:
+    df[f"{col}_Z"] = expanding_z_score(df[col])
+
+# Drop the first 30 rows (the warm-up period)
+df.dropna(inplace=True)
+
+# ==========================================
+# 3. BUILD THE AI MODEL (FIXED)
+# ==========================================
+# We use the Z-scored features here
+feature_names_z = ["Returns_Z", "Volatility_Z", "OAS_Diff_Z", "Rate_Diff_Z"]
+X = df[feature_names_z].values 
+
+model = GaussianHMM(n_components=2, covariance_type="full", n_iter=1000, random_state=42)
+model.fit(X)
+hidden_states = model.predict(X)
+
+# ==========================================
+# 4. AUTOMATIC STATE INTERPRETATION
+# ==========================================
+# We identify the 'Crisis' state by looking for high Volatility AND high Credit Spreads
+state_0_vol = df[hidden_states == 0]["Volatility_Z"].mean()
+state_1_vol = df[hidden_states == 1]["Volatility_Z"].mean()
+
+# High Z-score = Higher than average volatility
+if state_0_vol > state_1_vol:
+    crisis_state, calm_state = 0, 1
+else:
+    crisis_state, calm_state = 1, 0
+
+print(f"--> The AI has identified State {crisis_state} as the 'Crisis' Regime.")
+
+# ==========================================
+# 5. VISUALIZATION (Corrected Axis handling)
+# ==========================================
+# 1. Set the Date column as the index
+df.set_index("Date", inplace=True)
+
+# 2. Sort the index (Very important for chronological plotting)
+df.sort_index(inplace=True)
+
+fig, ax = plt.subplots(figsize=(14, 7))
+ax.plot(df.index, df["S&P Close"], color="black", linewidth=1.5, label="S&P 500 Price", alpha=0.9)
+
+# Optimization: Using fill_between for faster rendering than a loop
+# This creates a boolean mask for the crisis state
+crisis_mask = (hidden_states == crisis_state)
+ax.fill_between(df.index, df["S&P Close"].min(), df["S&P Close"].max(), 
+                where=crisis_mask, color='red', alpha=0.2, label='Crisis Regime')
+ax.fill_between(df.index, df["S&P Close"].min(), df["S&P Close"].max(), 
+                where=~crisis_mask, color='green', alpha=0.1, label='Calm Regime')
+
+ax.set_title(f"AI Risk Manager: Multidimensional Regime Detection", fontsize=16, fontweight='bold')
+ax.legend(loc='upper left')
+plt.show()
+
+# ==========================================
+# 6. FEATURE IMPORTANCE (The "Quant" Analysis)
+# ==========================================
+# state_means gives us the average Z-score for each feature per state
+state_means = model.means_ 
+
+# Importance = The distance between the Calm mean and Crisis mean
+# If a feature has a distance of 2.0, it means it moves 2 standard deviations 
+# when the regime shifts.
+importance = np.abs(state_means[0] - state_means[1])
+feature_names_raw = ["Returns", "Volatility", "Credit_Spread", "Rate_Change"]
+
+plt.figure(figsize=(10, 5))
+sns.barplot(x=feature_names_raw, y=importance, palette="magma")
+plt.title("What drives the Regime Shift? (Feature Separation Strength)")
+plt.ylabel("Z-Score Distance Between States")
+plt.show()
+
+# ==========================================
+# 7. PERFORMANCE METRICS
+# ==========================================
+def calculate_metrics(returns):
+    ann_return = returns.mean() * 252
+    ann_vol = returns.std() * np.sqrt(252)
+    sharpe = ann_return / ann_vol if ann_vol != 0 else 0
+    return ann_return, sharpe
+
+c_ret, c_sharpe = calculate_metrics(df[hidden_states == calm_state]["Returns"])
+cr_ret, cr_sharpe = calculate_metrics(df[hidden_states == crisis_state]["Returns"])
+
+print(f"\n[Calm Regime]  Ann. Return: {c_ret:.1%}, Sharpe: {c_sharpe:.2f}")
+print(f"[Crisis Regime] Ann. Return: {cr_ret:.1%}, Sharpe: {cr_sharpe:.2f}")
